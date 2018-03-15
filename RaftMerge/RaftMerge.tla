@@ -116,14 +116,21 @@ Min(s) == CHOOSE x \in s : \A y \in s : x <= y
 Max(s) == CHOOSE x \in s : \A y \in s : x >= y
 
 \* Add a message to the set of messages.
-Send(m) == messages' = messages \cup {m}
+Send(m) ==
+  /\ m \notin messages
+  /\ messages' = messages \cup {m}
 
 \* Remove a message from the set of messages. Used when a server is done
 \* processing a message.
-Discard(m) == messages' = messages \ {m}
+Discard(m) ==
+  /\ m \in messages
+  /\ messages' = messages \ {m}
 
 \* Combination of Send and Discard.
-Reply(reply, request) == messages' = (messages \cup {reply}) \ {request}
+Reply(reply, request) ==
+  /\ reply \notin messages
+  /\ request \in messages
+  /\ messages' = (messages \cup {reply}) \ {request}
 
 -------------------------------------------------------------------------------
 \* State transitions and message handlers for Raft.
@@ -159,6 +166,16 @@ AdvanceCommitIndex(i, r) ==
        raft' = [raft EXCEPT ![i][r].commit_index = new_commit_index]
   /\ UNCHANGED <<messages, region, client_vars>>
 
+AdvanceFollowerCommitIndex(i, r) ==
+  LET
+    leader == CHOOSE s \in Store : raft[s][r].is_leader
+    new_commit_index == Min({raft[leader][r].commit_index, Len(raft[i][r].logs)})
+  IN
+    /\ ~raft[i][r].is_leader
+    /\ raft[i][r].commit_index < new_commit_index
+    /\ raft' = [raft EXCEPT ![i][r].commit_index = new_commit_index]
+    /\ UNCHANGED <<messages, region, client_vars>>
+
 \* Server i of region r receives an AppendEntries request from server j.
 HandleAppendEntriesRequest(i, j, r, m) ==
   \/ \* Append this log entry if it is new.
@@ -178,7 +195,12 @@ HandleAppendEntriesRequest(i, j, r, m) ==
      /\ UNCHANGED <<region, client_vars>>
   \/ \* We already have this log entry, discarding this message.
      /\ m.entry_index <= Len(raft[i][r].logs)
-     /\ Discard(m)
+     /\ Reply([type        |-> AppendEntriesReply,
+               region      |-> r,
+               source      |-> i,
+               dest        |-> j,
+               match_index |-> Len(raft[i][r].logs)],
+              m)
      /\ UNCHANGED <<raft, region, client_vars>>
 
 \* Server i of region r receives an AppendEntries reply from server j.
@@ -372,6 +394,7 @@ Next ==
   \* Raft actions.
   \/ \E i, j \in Store : \E r \in Region : AppendEntries(i, j, r)
   \/ \E i \in Store : \E r \in Region : AdvanceCommitIndex(i, r)
+  \/ \E i \in Store : \E r \in Region : AdvanceFollowerCommitIndex(i, r)
   \/ \E m \in messages : Receive(m)
 
   \* External client can send requests to region B leader, to add a new log
@@ -382,6 +405,16 @@ Next ==
   \/ ProposeMergeRequest(LeaderB)
   \/ PerformRollbackRequest(LeaderB)
   \/ \E i \in Store : ApplyLog(i)
+
+Liveness ==
+  /\ WF_vars(\E i, j \in Store : \E r \in Region : AppendEntries(i, j, r))
+  /\ WF_vars(\E i \in Store : \E r \in Region : AdvanceCommitIndex(i, r))
+  /\ SF_vars(\E i \in Store : \E r \in Region : AdvanceFollowerCommitIndex(i, r))
+  /\ WF_vars(\E m \in messages : Receive(m))
+  /\ WF_vars(\E i \in Store : ClientRequest(i, RegionB, [type |-> LogNormal]))
+  /\ WF_vars(ProposeMergeRequest(LeaderB))
+  /\ WF_vars(PerformRollbackRequest(LeaderB))
+  /\ WF_vars(\E i \in Store : ApplyLog(i))
 
 Init ==
   /\ messages = {}
@@ -407,7 +440,7 @@ Init ==
   /\ client_requests_index = 0
 
 Spec ==
-  Init /\ [][Next]_vars
+  Init /\ [][Next]_vars /\ Liveness
 
 -------------------------------------------------------------------------------
 \* Type invariants.
@@ -519,5 +552,17 @@ MergeLogInvariant ==
 RaftMergeInvariant ==
   /\ RegionApplyInvariant
   /\ MergeLogInvariant
+
+-------------------------------------------------------------------------------
+
+EventuallyDone ==
+  <>[]
+  (
+    IF WillPerformRollback
+    THEN
+      \A i \in Store : region[i][RegionB] = RegionNormal
+    ELSE
+      \A i \in Store : region[i][RegionB] = RegionTombStone
+  )
 
 ===============================================================================
